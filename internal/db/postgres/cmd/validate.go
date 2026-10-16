@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -26,6 +27,7 @@ import (
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/utils"
 	"github.com/greenmaskio/greenmask/internal/domains"
 	"github.com/greenmaskio/greenmask/internal/storages"
+	"github.com/greenmaskio/greenmask/internal/utils/dumpstatus"
 	"github.com/greenmaskio/greenmask/internal/utils/reader"
 	"github.com/greenmaskio/greenmask/pkg/toolkit"
 )
@@ -50,13 +52,16 @@ type closeFunc func()
 type Validate struct {
 	*Dump
 	tmpDir   string
-	mainSt   storages.Storager
 	remoteSt storages.Storager
 	exitCode int
+	// pinnedBackups holds the remote storage inventory captured once at the
+	// validation start. Baseline resolution must never re-list the storage:
+	// otherwise a backup that is still uploading or being cleaned up could
+	// appear, disappear or be replaced while it is being inspected.
+	pinnedBackups []storages.Storager
 }
 
 func NewValidate(cfg *domains.Config, registry *utils.TransformerRegistry, st storages.Storager, remoteSt storages.Storager) (*Validate, error) {
-	mainSt := st
 	tmpDirName := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	st = st.SubStorage(tmpDirName, true)
 
@@ -69,20 +74,25 @@ func NewValidate(cfg *domains.Config, registry *utils.TransformerRegistry, st st
 		Dump:     d,
 		tmpDir:   tmpDirName,
 		exitCode: zeroExitCode,
-		mainSt:   mainSt,
 		remoteSt: remoteSt,
 	}, nil
 }
 
 func (v *Validate) Run(ctx context.Context) (int, error) {
 
+	// The temporary directory must be removed on every exit path, including
+	// failures. Its name looks like a backup directory id, therefore leaving
+	// it behind could make a later validation mistake partial validation data
+	// for a historical backup. Cleanup is unconditional and tolerant of a
+	// directory that was never created.
 	defer func() {
-		if !v.config.Validate.Diff {
-			return
-		}
-		if err := v.mainSt.Delete(ctx, v.tmpDir); err != nil {
+		log.Debug().Str("TmpDir", v.tmpDir).Msg("cleaning up temporary validation directory")
+		if err := v.st.DeleteAll(ctx, ""); err != nil && !isObjectNotFoundError(err) {
 			log.Warn().Err(err).Msg("error deleting temporary directory")
 		}
+	}()
+	defer func() {
+		v.prune()
 	}()
 	if err := custom.BootstrapCustomTransformers(ctx, v.registry, v.config.CustomTransformers); err != nil {
 		return nonZeroExitCode, fmt.Errorf("error bootstraping custom transformers: %w", err)
@@ -115,6 +125,13 @@ func (v *Validate) Run(ctx context.Context) (int, error) {
 
 	if err = v.gatherPgFacts(ctx, tx); err != nil {
 		return nonZeroExitCode, fmt.Errorf("error gathering facts: %w", err)
+	}
+
+	// Pin the remote inventory at the validation start. All later baseline
+	// decisions use this snapshot and never see a backup that appears,
+	// disappears or is replaced while the validation is running.
+	if err = v.pinBackupInventory(ctx); err != nil {
+		return nonZeroExitCode, fmt.Errorf("error pinning backup inventory: %w", err)
 	}
 
 	// Get list of tables to validate
@@ -323,30 +340,35 @@ func (v *Validate) getTablesToValidate() ([]*domains.Table, error) {
 	return tablesToValidate, nil
 }
 
+// schemaBaseline binds a backup identity to exactly one metadata read. The
+// pair is produced atomically by resolveSchemaBaseline and must never be
+// assembled from different candidates.
+type schemaBaseline struct {
+	dumpId string
+	md     *storageDto.Metadata
+}
+
 func (v *Validate) diffWithPreviousSchema(ctx context.Context) error {
 	if !v.config.Validate.Schema {
 		return nil
 	}
 
-	dumpId, err := v.getPreviousDumpId(ctx)
+	// Resolve and confirm the baseline before the current schema snapshot is
+	// compared with anything. No diff is computed or printed until both the
+	// live schema snapshot and a single, bound baseline metadata are known.
+	baseline, err := v.resolveSchemaBaseline(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot get previous dump id: %w", err)
+		return fmt.Errorf("cannot resolve schema diff baseline: %w", err)
 	}
-	if dumpId == "" {
+	if baseline == nil {
 		return nil
 	}
 
-	md, err := v.getPreviousMetadata(ctx, dumpId)
-	if err != nil {
-		return fmt.Errorf("cannot get previous metadata: %w", err)
-	}
-
-	diff := md.DatabaseSchema.Diff(v.context.DatabaseSchema)
+	diff := baseline.md.DatabaseSchema.Diff(v.context.DatabaseSchema)
 	if len(diff) > 0 {
 		v.exitCode = nonZeroExitCode
 
-		err = v.printSchemaDiff(diff, dumpId)
-		if err != nil {
+		if err = v.printSchemaDiff(diff, baseline.dumpId); err != nil {
 			return fmt.Errorf("cannot print schema diff: %w", err)
 		}
 	}
@@ -383,57 +405,107 @@ func (v *Validate) printSchemaDiff(diff []*toolkit.DiffNode, previousDumpId stri
 	return nil
 }
 
-func (v *Validate) getPreviousDumpId(ctx context.Context) (string, error) {
-	var backupNames []string
+// pinBackupInventory captures the remote storage inventory once. It is called
+// at the validation start, before any backup state is read.
+func (v *Validate) pinBackupInventory(ctx context.Context) error {
+	if !v.config.Validate.Schema || v.remoteSt == nil {
+		return nil
+	}
 
 	_, dirs, err := v.remoteSt.ListDir(ctx)
 	if err != nil {
-		return "", fmt.Errorf("cannot walk through directory: %w", err)
-	}
-	for _, dir := range dirs {
-		exists, err := dir.Exists(ctx, MetadataJsonFileName)
-		if err != nil {
-			return "", fmt.Errorf("cannot check file existence: %w", err)
-		}
-		if exists {
-			backupNames = append(backupNames, dir.Dirname())
-		}
+		return fmt.Errorf("cannot list backups: %w", err)
 	}
 
-	slices.SortFunc(
-		backupNames, func(a, b string) int {
-			if a > b {
-				return -1
-			}
-			return 1
-		},
-	)
-	if len(backupNames) > 0 {
-		return backupNames[0], nil
-	}
-	return "", nil
+	// Sort the pinned snapshot once, newest backup first.
+	slices.SortFunc(dirs, func(a, b storages.Storager) int {
+		return cmp.Compare(b.Dirname(), a.Dirname())
+	})
+	v.pinnedBackups = dirs
+	return nil
 }
 
-func (v *Validate) getPreviousMetadata(ctx context.Context, dumpId string) (*storageDto.Metadata, error) {
-
-	st := v.remoteSt.SubStorage(dumpId, true)
-
-	f, err := st.GetObject(ctx, MetadataJsonFileName)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open metadata file: %w", err)
-	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			log.Warn().Err(err).Msg("error closing metadata file")
+// resolveSchemaBaseline selects the most recent backup that can safely be used
+// as a schema diff baseline. It iterates only over the inventory pinned at the
+// validation start and never re-lists the storage.
+//
+// Outcomes for every candidate are deterministic:
+//   - completed, readable and comparable backup: used as the baseline;
+//   - corrupt backup (status is done but metadata is unreadable): skipped with
+//     a warning so older backups can still provide a baseline;
+//   - transient storage error while reading the status: validation stops;
+//   - candidate that disappears or is replaced while being read: skipped and
+//     another candidate from the pinned inventory is selected.
+func (v *Validate) resolveSchemaBaseline(ctx context.Context) (*schemaBaseline, error) {
+	for _, candidate := range v.pinnedBackups {
+		baseline, err := v.inspectBaselineCandidate(ctx, candidate)
+		if err != nil {
+			// The backup state cannot be determined right now: stop instead
+			// of guessing and reporting a schema change that may not exist.
+			return nil, err
 		}
-	}()
-
-	previousMetadata := &storageDto.Metadata{}
-
-	if err = json.NewDecoder(f).Decode(&previousMetadata); err != nil {
-		return nil, fmt.Errorf("cannot decode metadata file: %w", err)
+		if baseline != nil {
+			return baseline, nil
+		}
 	}
-	return previousMetadata, nil
+	return nil, nil
+}
+
+func (v *Validate) inspectBaselineCandidate(ctx context.Context, candidate storages.Storager) (*schemaBaseline, error) {
+	dumpId := candidate.Dirname()
+
+	md, err := dumpstatus.LookupDoneMetadata(ctx, candidate)
+	if err != nil {
+		if errors.Is(err, dumpstatus.ErrCorruptMetadata) {
+			// A corrupt highest candidate must not abort validation: skip it
+			// and continue with older backups from the pinned inventory.
+			log.Warn().
+				Err(err).
+				Str("DumpId", dumpId).
+				Msg("skipping corrupt backup while looking for schema diff baseline")
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cannot determine backup %q state: %w", dumpId, err)
+	}
+	if md == nil {
+		// In progress, failed, completed for another purpose, or vanished
+		// while being read: another candidate may be usable.
+		log.Debug().
+			Str("DumpId", dumpId).
+			Msg("backup is not a usable schema diff baseline, trying the next one")
+		return nil, nil
+	}
+
+	if !v.isMetadataComparable(md) {
+		log.Debug().
+			Str("DumpId", dumpId).
+			Str("BackupDatabase", md.Header.DbName).
+			Str("CurrentDatabase", v.dbName).
+			Msg("backup belongs to another database, skipping it as schema diff baseline")
+		return nil, nil
+	}
+
+	return &schemaBaseline{
+		dumpId: dumpId,
+		md:     md,
+	}, nil
+}
+
+// isMetadataComparable reports whether a backup can be diffed against the
+// current PostgreSQL database. Table OIDs are only unique inside a database,
+// therefore a backup taken from another database must never be compared here.
+func (v *Validate) isMetadataComparable(md *storageDto.Metadata) bool {
+	return md.Header.DbName != "" && md.Header.DbName == v.dbName
+}
+
+// isObjectNotFoundError reports whether err means that the object does not
+// exist, regardless of the storage backend in use. Removing a temporary
+// directory that was never created must not be treated as a failure.
+func isObjectNotFoundError(err error) bool {
+	if errors.Is(err, storages.ErrFileNotFound) {
+		return true
+	}
+	return os.IsNotExist(err)
 }
 
 func findTableBySchemaAndName(Transformations []*domains.Table, schemaName, tableName string) (*domains.Table, error) {

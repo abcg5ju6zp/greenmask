@@ -365,6 +365,14 @@ func (s *Storage) Stat(fileName string) (*domains.ObjectStat, error) {
 
 	headObjectOutput, err := s.service.HeadObject(headObjectInput)
 	if err != nil {
+		var awsErr awserr.Error
+		if errors.As(err, &awsErr) &&
+			(awsErr.Code() == NotFountAwsErrorCode || awsErr.Code() == NoSuchKeyAwsErrorCode) {
+			return &domains.ObjectStat{
+				Name:  fullPath,
+				Exist: false,
+			}, nil
+		}
 		return nil, fmt.Errorf("error getting object info: %w", err)
 	}
 

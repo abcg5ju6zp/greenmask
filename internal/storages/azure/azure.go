@@ -267,6 +267,12 @@ func (s *Storage) Stat(fileName string) (*domains.ObjectStat, error) {
 	blobClient := s.containerClient.NewBlockBlobClient(fullPath)
 	props, err := blobClient.GetProperties(context.Background(), nil)
 	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return &domains.ObjectStat{
+				Name:  fullPath,
+				Exist: false,
+			}, nil
+		}
 		return nil, fmt.Errorf("error getting object info: %w", err)
 	}
 

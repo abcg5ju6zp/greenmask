@@ -40,21 +40,18 @@ import (
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/utils"
 	"github.com/greenmaskio/greenmask/internal/domains"
 	"github.com/greenmaskio/greenmask/internal/storages"
+	"github.com/greenmaskio/greenmask/internal/utils/dumpstatus"
 	"github.com/greenmaskio/greenmask/pkg/toolkit"
 )
 
+// Backup layout and heartbeat marker names are defined canonically in the
+// dumpstatus package and re-exported here for backward compatibility.
 const (
-	MetadataJsonFileName = "metadata.json"
-	HeartBeatFileName    = "heartbeat"
-)
-
-const (
-	HeartBeatWriteInterval = 15 * time.Minute
-)
-
-const (
-	HeartBeatDoneContent       = "done"
-	HeartBeatInProgressContent = "in-progress"
+	MetadataJsonFileName       = dumpstatus.MetadataJsonFileName
+	HeartBeatFileName          = dumpstatus.HeartBeatFileName
+	HeartBeatWriteInterval     = dumpstatus.HeartBeatWriteInterval
+	HeartBeatDoneContent       = dumpstatus.HeartBeatDoneContent
+	HeartBeatInProgressContent = dumpstatus.HeartBeatInProgressContent
 )
 
 type Dump struct {
@@ -80,6 +77,9 @@ type Dump struct {
 	dumpDependenciesGraph map[int32][]int32
 	// sortedTablesDumpIds - sorted tables dump ids in topological order
 	sortedTablesDumpIds []int32
+	// dbName - the name of the database the dump is taken from; used to check
+	// that a previous backup can be compared with the current database
+	dbName string
 	// validate shows that dump worker must be in validation mode
 	validate          bool
 	validateRowsLimit uint64
@@ -114,13 +114,14 @@ func (d *Dump) prune() {
 func (d *Dump) gatherPgFacts(ctx context.Context, tx pgx.Tx) error {
 	getVersionQuery := `
 		select 
-		    setting::INT 
+		    setting::INT,
+		    current_database()
 		from pg_settings 
 		where name = 'server_version_num'
 	`
 
 	row := tx.QueryRow(ctx, getVersionQuery)
-	if err := row.Scan(&d.version); err != nil {
+	if err := row.Scan(&d.version, &d.dbName); err != nil {
 		return fmt.Errorf("error getting pg version: %w", err)
 	}
 	return nil
