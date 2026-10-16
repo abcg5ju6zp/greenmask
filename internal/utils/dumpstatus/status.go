@@ -45,7 +45,7 @@ const failedTimeoutMultiplayer time.Duration = 2
 var ErrCorruptMetadata = errors.New("backup metadata is corrupt")
 
 func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string, *storage.Metadata, error) {
-	objectInfo, err := st.Stat(cmd.HeartBeatFileName)
+	objectInfo, err := st.Stat(HeartBeatFileName)
 	if err != nil {
 		return "", nil, err
 	}
@@ -67,7 +67,7 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 			}
 			return "", nil, fmt.Errorf("failed to get metadata: %w", err)
 		}
-		return heartBeatDoneContent, md, nil
+		return HeartBeatDoneContent, md, nil
 	}
 
 	data, err := getHeartbeat(ctx, st)
@@ -78,7 +78,7 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 		return FailedStatusName, nil, nil
 	}
 	switch string(data) {
-	case cmd.HeartBeatDoneContent:
+	case HeartBeatDoneContent:
 		// if done - read and parse metadata
 		md, err := getMetadata(ctx, st)
 		if err != nil {
@@ -87,9 +87,9 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 			}
 			return "", nil, fmt.Errorf("failed to get metadata: %w", err)
 		}
-		return heartBeatDoneContent, md, nil
-	case cmd.HeartBeatInProgressContent:
-		if time.Now().After(objectInfo.LastModified.Add(cmd.HeartBeatWriteInterval * failedTimeoutMultiplayer)) {
+		return HeartBeatDoneContent, md, nil
+	case HeartBeatInProgressContent:
+		if time.Now().After(objectInfo.LastModified.Add(HeartBeatWriteInterval * failedTimeoutMultiplayer)) {
 			return FailedStatusName, nil, nil
 		}
 		return InProgressStatusName, nil, nil
@@ -112,7 +112,7 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 //   - any other error: a transient storage error. The caller must stop instead
 //     of guessing, since the backup state cannot be determined.
 func LookupDoneMetadata(ctx context.Context, st storages.Storager) (*storage.Metadata, error) {
-	hbStat, err := st.Stat(cmd.HeartBeatFileName)
+	hbStat, err := st.Stat(HeartBeatFileName)
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat heartbeat: %w", err)
 	}
@@ -128,9 +128,9 @@ func LookupDoneMetadata(ctx context.Context, st storages.Storager) (*storage.Met
 			return nil, fmt.Errorf("failed to read heartbeat: %w", err)
 		}
 		switch string(data) {
-		case cmd.HeartBeatDoneContent:
+		case HeartBeatDoneContent:
 			// Completed marker: proceed to the metadata.
-		case cmd.HeartBeatInProgressContent:
+		case HeartBeatInProgressContent:
 			// The upload or cleanup is still running, even if the marker is
 			// stale. Such a backup must never be used as a baseline.
 			return nil, nil
@@ -140,7 +140,7 @@ func LookupDoneMetadata(ctx context.Context, st storages.Storager) (*storage.Met
 		}
 	}
 
-	mdStat, err := st.Stat(cmd.MetadataJsonFileName)
+	mdStat, err := st.Stat(MetadataJsonFileName)
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat metadata: %w", err)
 	}
@@ -193,7 +193,7 @@ func LookupDoneMetadata(ctx context.Context, st storages.Storager) (*storage.Met
 func backupMutated(
 	st storages.Storager, hbStat, mdStat *domains.ObjectStat,
 ) (bool, error) {
-	currentMdStat, err := st.Stat(cmd.MetadataJsonFileName)
+	currentMdStat, err := st.Stat(MetadataJsonFileName)
 	if err != nil {
 		return false, err
 	}
@@ -206,7 +206,7 @@ func backupMutated(
 		return false, nil
 	}
 
-	currentHbStat, err := st.Stat(cmd.HeartBeatFileName)
+	currentHbStat, err := st.Stat(HeartBeatFileName)
 	if err != nil {
 		return false, err
 	}
@@ -231,7 +231,7 @@ func statChanged(before, after *domains.ObjectStat) bool {
 }
 
 func isMetadataExist(st storages.Storager) (bool, error) {
-	stat, err := st.Stat(cmd.MetadataJsonFileName)
+	stat, err := st.Stat(MetadataJsonFileName)
 	if err != nil {
 		return false, err
 	}
@@ -239,7 +239,7 @@ func isMetadataExist(st storages.Storager) (bool, error) {
 }
 
 func getHeartbeat(ctx context.Context, st storages.Storager) ([]byte, error) {
-	f, err := st.GetObject(ctx, cmd.HeartBeatFileName)
+	f, err := st.GetObject(ctx, HeartBeatFileName)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +256,7 @@ func getHeartbeat(ctx context.Context, st storages.Storager) ([]byte, error) {
 }
 
 func getMetadata(ctx context.Context, st storages.Storager) (*storage.Metadata, error) {
-	mf, err := st.GetObject(ctx, cmd.MetadataJsonFileName)
+	mf, err := st.GetObject(ctx, MetadataJsonFileName)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata from storage: %w", err)
 	}
