@@ -151,6 +151,7 @@ func (s *Storage) Stat(fileName string) (*domains.ObjectStat, error) {
 		Name:         path.Base(fileName),
 		Exist:        true,
 		LastModified: obj.lastModified,
+		Size:         int64(len(obj.data)),
 	}, nil
 }
 

@@ -31,6 +31,7 @@ import (
 	"github.com/greenmaskio/greenmask/internal/storages/builder"
 	"github.com/greenmaskio/greenmask/internal/utils/dumpstatus"
 	"github.com/greenmaskio/greenmask/internal/utils/logger"
+	"github.com/greenmaskio/greenmask/internal/utils/restorelock"
 )
 
 var (
@@ -127,10 +128,51 @@ func deleteDump(ctx context.Context, st storages.Storager, dumpId string) error 
 		Str("DumpId", dumpId).
 		Msg("deleting dump")
 
-	if err = st.DeleteAll(ctx, dumpId); err != nil {
-		return fmt.Errorf("storage error: %s", err)
+	if err = guardedDeleteDump(ctx, st, dumpId, true); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+// guardedDeleteDump deletes a dump only when no live restore task holds it.
+// Locks left by a restore process that crashed are expired, removed as stale
+// and the deletion proceeds with its original plan. For explicit deletion an
+// active hold is reported as an error; retention cleanup logs the blocked
+// dump and skips it while continuing with the rest of its plan.
+func guardedDeleteDump(ctx context.Context, st storages.Storager, dumpId string, explicit bool) error {
+	active, err := restorelock.CheckActive(ctx, st, dumpId, time.Now())
+	if err != nil {
+		return fmt.Errorf("cannot check restore holds for dump %s: %w", dumpId, err)
+	}
+	for _, lock := range active {
+		log.Warn().
+			Str("DumpId", dumpId).
+			Str("BackupIdentity", lock.Identity).
+			Str("Token", lock.Token).
+			Str("Host", lock.Host).
+			Int("Pid", lock.Pid).
+			Time("StartedAt", lock.StartedAt).
+			Time("ExpiresAt", lock.ExpiresAt).
+			Msg("blocked dump deletion: objects are held by an active restore task")
+	}
+	if len(active) > 0 {
+		if explicit {
+			return fmt.Errorf(
+				"%w: dump %s is held by %d active restore task(s), retry after the restore finishes",
+				restorelock.ErrDeletionBlocked, dumpId, len(active),
+			)
+		}
+		log.Warn().
+			Str("DumpId", dumpId).
+			Int("ActiveRestores", len(active)).
+			Msg("skipping dump deletion and continuing with the retention plan")
+		return nil
+	}
+
+	if err := st.DeleteAll(ctx, dumpId); err != nil {
+		return fmt.Errorf("storage error: %w", err)
+	}
 	return nil
 }
 
@@ -306,7 +348,7 @@ func deleteDumpById(ctx context.Context, st storages.Storager, d *Dump, dryRun b
 	if dryRun {
 		return nil
 	}
-	if err := st.DeleteAll(ctx, d.DumpId); err != nil {
+	if err := guardedDeleteDump(ctx, st, d.DumpId, false); err != nil {
 		return err
 	}
 	return nil

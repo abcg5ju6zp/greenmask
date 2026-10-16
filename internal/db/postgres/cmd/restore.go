@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,6 +44,9 @@ import (
 	"github.com/greenmaskio/greenmask/internal/db/postgres/utils"
 	"github.com/greenmaskio/greenmask/internal/domains"
 	"github.com/greenmaskio/greenmask/internal/storages"
+	"github.com/greenmaskio/greenmask/internal/utils/backupidentity"
+	"github.com/greenmaskio/greenmask/internal/utils/dumpstatus"
+	"github.com/greenmaskio/greenmask/internal/utils/restorelock"
 	"github.com/greenmaskio/greenmask/pkg/toolkit"
 )
 
@@ -84,6 +88,8 @@ type restorationTask interface {
 
 type Restore struct {
 	binPath    string
+	rootSt     storages.Storager
+	dumpId     string
 	dsn        string
 	scripts    map[string][]pgrestore.Script
 	pgRestore  *pgrestore.PgRestore
@@ -96,6 +102,13 @@ type Restore struct {
 	metadata   *storage.Metadata
 	mx         *sync.RWMutex
 
+	// identity is the pinned backup generation accepted for this restore. All
+	// phases read only objects of this generation.
+	identity *backupidentity.Identity
+	// generationChanged is set as soon as any check observes that the backup
+	// directory was deleted or replaced by another generation.
+	generationChanged atomic.Bool
+
 	preDataClenUpToc  string
 	postDataClenUpToc string
 	restoredDumpIds   map[int32]bool
@@ -103,10 +116,13 @@ type Restore struct {
 }
 
 func NewRestore(
-	binPath string, st storages.Storager, cfg *domains.Restore, s map[string][]pgrestore.Script, tmpDir string,
+	binPath string, rootSt storages.Storager, dumpId string, st storages.Storager,
+	cfg *domains.Restore, s map[string][]pgrestore.Script, tmpDir string,
 ) *Restore {
 	return &Restore{
 		binPath:         binPath,
+		rootSt:          rootSt,
+		dumpId:          dumpId,
 		st:              st,
 		pgRestore:       pgrestore.NewPgRestore(binPath),
 		restoreOpt:      &cfg.PgRestoreOptions,
@@ -119,12 +135,44 @@ func NewRestore(
 	}
 }
 
-func (r *Restore) Run(ctx context.Context) error {
+func (r *Restore) Run(ctx context.Context) (err error) {
 	defer r.prune()
 
-	if err := r.readMetadata(ctx); err != nil {
-		return fmt.Errorf("cannot read metadata: %w", err)
+	// Accept the backup before touching the target database: it must be fully
+	// finished and metadata.json, toc.dat and all data objects must belong to
+	// the same generation. That generation is then pinned for every phase.
+	identity, err := r.acceptBackup(ctx)
+	if err != nil {
+		return err
 	}
+	r.identity = identity
+
+	// Hold the backup directory for the whole restore: neither explicit
+	// deletion nor retention cleanup may reclaim its objects while this
+	// restore is alive. The hold expires (and becomes recognizable as stale)
+	// if this process dies without releasing it.
+	hold, err := restorelock.Acquire(
+		ctx, r.rootSt, r.dumpId, identity.Fingerprint(), restorelock.DefaultTTL,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot establish restore hold: %w", err)
+	}
+	holdCtx, cancelHold := context.WithCancel(ctx)
+	defer cancelHold()
+	go hold.KeepAlive(holdCtx)
+	defer func() {
+		if releaseErr := hold.Release(); releaseErr != nil {
+			log.Warn().
+				Err(releaseErr).
+				Str("dumpId", r.dumpId).
+				Str("backupIdentity", identity.ShortFingerprint()).
+				Msg("cannot release restore lock")
+		}
+	}()
+
+	// From now on every storage object is re-validated against the pinned
+	// generation before it is opened.
+	r.st = backupidentity.NewPinnedStorage(r.st, identity)
 
 	if err := r.prepare(ctx); err != nil {
 		return fmt.Errorf("preparation error: %w", err)
@@ -149,6 +197,56 @@ func (r *Restore) Run(ctx context.Context) error {
 	return nil
 }
 
+// acceptBackup confirms the backup is complete, reads metadata and toc.dat,
+// pins the common generation of metadata.json, toc.dat and every data object
+// and rejects the task without modifying the target database if the backup is
+// incomplete or already corrupted.
+func (r *Restore) acceptBackup(ctx context.Context) (*backupidentity.Identity, error) {
+	status, md, err := dumpstatus.GetDumpStatusAndMetadata(ctx, r.st)
+	if err != nil {
+		return nil, fmt.Errorf("cannot determine backup status: %w", err)
+	}
+	if status != dumpstatus.DoneStatusName {
+		return nil, fmt.Errorf(
+			"%w: dump %q has status %q, only a completely finished backup can be restored",
+			backupidentity.ErrBackupIncomplete, r.dumpId, status,
+		)
+	}
+	r.metadata = md
+
+	if err := r.readTocDatFile(ctx); err != nil {
+		return nil, fmt.Errorf("cannot read toc: %w", err)
+	}
+
+	identity, err := backupidentity.Build(ctx, r.st, r.dumpId, r.tocObj, md)
+	if err != nil {
+		return nil, err
+	}
+	r.identity = identity
+
+	log.Info().
+		Str("dumpId", r.dumpId).
+		Str("backupIdentity", identity.ShortFingerprint()).
+		Int("objects", len(identity.ObjectNames())).
+		Msg("backup accepted: generation pinned for the whole restore")
+	return identity, nil
+}
+
+// failGeneration records that the pinned generation is no longer valid and
+// returns a wrapped error that aborts scheduling.
+func (r *Restore) failGeneration(err error) error {
+	r.generationChanged.Store(true)
+	log.Error().
+		Err(err).
+		Str("dumpId", r.dumpId).
+		Str("backupIdentity", r.identity.ShortFingerprint()).
+		Msg("backup generation changed while reading: no new restore tasks will be scheduled")
+	return fmt.Errorf(
+		"backup %s (identity %s) generation is no longer valid: %w",
+		r.dumpId, r.identity.ShortFingerprint(), err,
+	)
+}
+
 func (r *Restore) putDumpId(task restorationTask) {
 	r.mx.Lock()
 	r.restoredDumpIds[task.GetEntry().DumpId] = true
@@ -164,17 +262,6 @@ func (r *Restore) dependenciesAreRestored(deps []int32) bool {
 		}
 	}
 	return true
-}
-
-func (r *Restore) readMetadata(ctx context.Context) error {
-	f, err := r.st.GetObject(ctx, MetadataJsonFileName)
-	if err != nil {
-		return fmt.Errorf("cannot open metadata file: %w", err)
-	}
-	if err := json.NewDecoder(f).Decode(r.metadata); err != nil {
-		return fmt.Errorf("cannot decode metadata: %w", err)
-	}
-	return nil
 }
 
 func (r *Restore) RunScripts(ctx context.Context, conn *pgx.Conn, section, when string) error {
@@ -222,10 +309,6 @@ func (r *Restore) RunScripts(ctx context.Context, conn *pgx.Conn, section, when 
 func (r *Restore) prepare(ctx context.Context) error {
 	if err := os.Mkdir(r.tmpDir, 0700); err != nil {
 		return fmt.Errorf("error creating temp dir: %w", err)
-	}
-
-	if err := r.readTocDatFile(ctx); err != nil {
-		return fmt.Errorf("read toc header: %w", err)
 	}
 
 	if r.restoreOpt.UseList != "" {
@@ -570,8 +653,19 @@ func (r *Restore) dataRestore(ctx context.Context) error {
 
 	eg.Go(r.taskPusher(gtx, tasks))
 
-	if err := eg.Wait(); err != nil {
-		return fmt.Errorf("at least one worker exited with error: %w", err)
+	waitErr := eg.Wait()
+	if waitErr != nil {
+		if r.generationChanged.Load() ||
+			errors.Is(waitErr, backupidentity.ErrGenerationChanged) ||
+			errors.Is(waitErr, backupidentity.ErrObjectMissing) {
+			return fmt.Errorf(
+				"data stage aborted at phase data: backup %s (identity %s) was deleted or replaced by "+
+					"another generation while reading; scheduling of new tasks was stopped and in-flight "+
+					"transactions were rolled back: %w",
+				r.dumpId, r.identity.ShortFingerprint(), waitErr,
+			)
+		}
+		return fmt.Errorf("at least one worker exited with error: %w", waitErr)
 	}
 
 	// Execute Data After scripts
@@ -766,6 +860,13 @@ func (r *Restore) taskPusher(ctx context.Context, tasks chan restorationTask) fu
 			default:
 			}
 
+			// Stop claiming new objects as soon as the pinned generation
+			// stops being valid. In-flight workers are canceled by the
+			// errgroup context and finish their transaction or roll it back.
+			if err := r.identity.VerifyAnchors(ctx, r.st); err != nil {
+				return r.failGeneration(err)
+			}
+
 			if !r.isNeedRestore(entry) {
 				continue
 			}
@@ -780,6 +881,14 @@ func (r *Restore) taskPusher(ctx context.Context, tasks chan restorationTask) fu
 			var task restorationTask
 			if entry.Desc == nil {
 				continue
+			}
+
+			// Claim the specific data object of this entry against the pinned
+			// generation before the task is handed to a worker.
+			if entry.FileName != nil && *entry.FileName != "" {
+				if err := r.identity.VerifyObject(ctx, r.st, *entry.FileName); err != nil {
+					return r.failGeneration(err)
+				}
 			}
 			switch *entry.Desc {
 			case toc.TableDataDesc:
@@ -877,6 +986,10 @@ func (r *Restore) restoreWorker(ctx context.Context, tasks <-chan restorationTas
 
 		// Open new transaction for each task
 		if err = task.Execute(ctx, utils.NewPGConn(conn)); err != nil {
+			if errors.Is(err, backupidentity.ErrGenerationChanged) ||
+				errors.Is(err, backupidentity.ErrObjectMissing) {
+				r.generationChanged.Store(true)
+			}
 			return fmt.Errorf("unable to perform restoration task (worker %d restoring %s): %w", id, task.DebugInfo(), err)
 		}
 		r.putDumpId(task)

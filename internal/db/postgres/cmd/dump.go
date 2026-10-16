@@ -40,21 +40,20 @@ import (
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/utils"
 	"github.com/greenmaskio/greenmask/internal/domains"
 	"github.com/greenmaskio/greenmask/internal/storages"
+	"github.com/greenmaskio/greenmask/internal/utils/backupidentity"
 	"github.com/greenmaskio/greenmask/pkg/toolkit"
 )
 
 const (
-	MetadataJsonFileName = "metadata.json"
-	HeartBeatFileName    = "heartbeat"
+	MetadataJsonFileName = backupidentity.MetadataObjectName
+	HeartBeatFileName    = backupidentity.HeartbeatObjectName
 )
 
-const (
-	HeartBeatWriteInterval = 15 * time.Minute
-)
+const HeartBeatWriteInterval = backupidentity.HeartbeatWriteInterval
 
 const (
-	HeartBeatDoneContent       = "done"
-	HeartBeatInProgressContent = "in-progress"
+	HeartBeatDoneContent       = backupidentity.HeartbeatDoneContent
+	HeartBeatInProgressContent = backupidentity.HeartbeatInProgressContent
 )
 
 type Dump struct {

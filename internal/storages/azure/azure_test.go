@@ -466,14 +466,14 @@ func TestStorage_Exists(t *testing.T) {
 
 func TestStorage_Stat(t *testing.T) {
 	tests := []struct {
-		name    string
-		putKey  string
-		statKey string
-		wantErr bool
+		name      string
+		putKey    string
+		statKey   string
+		wantExist bool
 	}{
-		{"existing root", "f.txt", "f.txt", false},
-		{"existing nested", "d/f.txt", "d/f.txt", false},
-		{"missing", "", "missing.txt", true},
+		{"existing root", "f.txt", "f.txt", true},
+		{"existing nested", "d/f.txt", "d/f.txt", true},
+		{"missing", "", "missing.txt", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -482,14 +482,13 @@ func TestStorage_Stat(t *testing.T) {
 				putObject(t, st, tt.putKey, []byte("data"))
 			}
 			stat, err := st.Stat(tt.statKey)
-			if tt.wantErr {
-				assert.Error(t, err)
-				return
-			}
 			require.NoError(t, err)
-			assert.True(t, stat.Exist)
-			assert.Equal(t, tt.statKey, stat.Name)
-			assert.False(t, stat.LastModified.IsZero())
+			assert.Equal(t, tt.wantExist, stat.Exist)
+			if tt.wantExist {
+				assert.Equal(t, tt.statKey, stat.Name)
+				assert.False(t, stat.LastModified.IsZero())
+				assert.Equal(t, int64(len("data")), stat.Size)
+			}
 		})
 	}
 }

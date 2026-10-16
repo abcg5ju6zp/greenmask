@@ -339,6 +339,7 @@ func (s *Storage) Stat(fileName string) (*domains.ObjectStat, error) {
 	return &domains.ObjectStat{
 		Name:         fullPath,
 		LastModified: fileInfo.ModTime(),
+		Size:         fileInfo.Size(),
 		Exist:        true,
 	}, nil
 }

@@ -267,14 +267,29 @@ func (s *Storage) Stat(fileName string) (*domains.ObjectStat, error) {
 	blobClient := s.containerClient.NewBlockBlobClient(fullPath)
 	props, err := blobClient.GetProperties(context.Background(), nil)
 	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return &domains.ObjectStat{
+				Name:  fullPath,
+				Exist: false,
+			}, nil
+		}
 		return nil, fmt.Errorf("error getting object info: %w", err)
 	}
 
 	return &domains.ObjectStat{
 		Name:         fullPath,
 		LastModified: *props.LastModified,
+		Size:         ptrValue(props.ContentLength),
 		Exist:        true,
 	}, nil
+}
+
+// ptrValue safely dereferences an *int64, returning 0 for a nil pointer.
+func ptrValue(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 // Close is a no-op: the Azure blob client manages its own pooled HTTP

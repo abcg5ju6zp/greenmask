@@ -66,10 +66,10 @@ var (
 				log.Fatal().Err(err).Msg("")
 			}
 
-			st = st.SubStorage(dumpId, true)
+			dumpSt := st.SubStorage(dumpId, true)
 
 			restore := cmdInternals.NewRestore(
-				Config.Common.PgBinPath, st, &Config.Restore, Config.Restore.Scripts,
+				Config.Common.PgBinPath, st, dumpId, dumpSt, &Config.Restore, Config.Restore.Scripts,
 				Config.Common.TempDirectory,
 			)
 

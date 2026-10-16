@@ -10,9 +10,9 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/greenmaskio/greenmask/internal/db/postgres/cmd"
 	"github.com/greenmaskio/greenmask/internal/db/postgres/storage"
 	"github.com/greenmaskio/greenmask/internal/storages"
+	"github.com/greenmaskio/greenmask/internal/utils/backupidentity"
 )
 
 const (
@@ -24,10 +24,8 @@ const (
 
 const failedTimeoutMultiplayer time.Duration = 2
 
-const heartBeatDoneContent = "done"
-
 func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string, *storage.Metadata, error) {
-	objectInfo, err := st.Stat(cmd.HeartBeatFileName)
+	objectInfo, err := st.Stat(backupidentity.HeartbeatObjectName)
 	if err != nil {
 		return "", nil, err
 	}
@@ -49,10 +47,10 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 			}
 			return "", nil, fmt.Errorf("failed to get metadata: %w", err)
 		}
-		return heartBeatDoneContent, md, nil
+		return backupidentity.HeartbeatDoneContent, md, nil
 	}
 
-	f, err := st.GetObject(ctx, cmd.HeartBeatFileName)
+	f, err := st.GetObject(ctx, backupidentity.HeartbeatObjectName)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get heart beat file: %w", err)
 	}
@@ -69,7 +67,7 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 		return FailedStatusName, nil, nil
 	}
 	switch string(data) {
-	case cmd.HeartBeatDoneContent:
+	case backupidentity.HeartbeatDoneContent:
 		// if done - read and parse metadata
 		md, err := getMetadata(ctx, st)
 		if err != nil {
@@ -78,9 +76,9 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 			}
 			return "", nil, fmt.Errorf("failed to get metadata: %w", err)
 		}
-		return heartBeatDoneContent, md, nil
-	case cmd.HeartBeatInProgressContent:
-		if time.Now().After(objectInfo.LastModified.Add(cmd.HeartBeatWriteInterval * failedTimeoutMultiplayer)) {
+		return backupidentity.HeartbeatDoneContent, md, nil
+	case backupidentity.HeartbeatInProgressContent:
+		if time.Now().After(objectInfo.LastModified.Add(backupidentity.HeartbeatWriteInterval * failedTimeoutMultiplayer)) {
 			return FailedStatusName, nil, nil
 		}
 		return InProgressStatusName, nil, nil
@@ -89,7 +87,7 @@ func GetDumpStatusAndMetadata(ctx context.Context, st storages.Storager) (string
 }
 
 func isMetadataExist(st storages.Storager) (bool, error) {
-	stat, err := st.Stat(cmd.MetadataJsonFileName)
+	stat, err := st.Stat(backupidentity.MetadataObjectName)
 	if err != nil {
 		return false, err
 	}
@@ -97,7 +95,7 @@ func isMetadataExist(st storages.Storager) (bool, error) {
 }
 
 func getMetadata(ctx context.Context, st storages.Storager) (*storage.Metadata, error) {
-	mf, err := st.GetObject(ctx, cmd.MetadataJsonFileName)
+	mf, err := st.GetObject(ctx, backupidentity.MetadataObjectName)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata from storage: %w", err)
 	}
