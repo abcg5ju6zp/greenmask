@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"github.com/greenmaskio/greenmask/internal/storages"
 	"github.com/greenmaskio/greenmask/internal/storages/domains"
 )
@@ -93,6 +95,7 @@ func (s *Storage) GetObject(ctx context.Context, filePath string) (reader io.Rea
 }
 
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
+	fullPath := path.Join(s.cwd, filePath)
 	_, err := os.Stat(path.Join(s.cwd, path.Dir(filePath)))
 	var errNo syscall.Errno
 	if err != nil && errors.As(err, &errNo) && errNo == 0x2 {
@@ -105,14 +108,30 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	} else if err != nil {
 		return fmt.Errorf("error getting file stat: %w", err)
 	}
-	f, err := os.Create(path.Join(s.cwd, filePath))
+	f, err := os.Create(fullPath)
 	if err != nil {
 		return fmt.Errorf("unable to create file: %w", err)
 	}
 
+	// On any failure the partially written file must be removed so that a truncated
+	// object can never be picked up as a part of a restorable backup.
+	completed := false
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Debug().Err(cerr).Str("path", fullPath).Msg("error closing object file")
+		}
+		if completed {
+			return
+		}
+		if rmErr := os.Remove(fullPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			log.Warn().Err(rmErr).Str("path", fullPath).Msg("error removing incomplete object file")
+		}
+	}()
+
 	done := make(chan struct{})
+	var copyErr error
 	go func() {
-		_, err = io.Copy(f, body)
+		_, copyErr = io.Copy(f, body)
 		close(done)
 	}()
 
@@ -122,9 +141,10 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	case <-done:
 	}
 
-	if err != nil {
-		return fmt.Errorf("error writing data: %w", err)
+	if copyErr != nil {
+		return fmt.Errorf("error writing data: %w", copyErr)
 	}
+	completed = true
 	return nil
 }
 

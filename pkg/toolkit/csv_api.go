@@ -15,8 +15,10 @@
 package toolkit
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -31,6 +33,7 @@ type CsvApi struct {
 	transferringColumns []*Column
 	affectedColumns     []*Column
 	w                   *csv.Writer
+	stream              io.Writer
 	r                   *csv.Reader
 	record              *RawRecordCsv
 }
@@ -64,6 +67,7 @@ func NewCsvApi(transferringColumns []*Column, affectedColumns []*Column, driver 
 }
 
 func (ca *CsvApi) SetWriter(w io.Writer) {
+	ca.stream = w
 	ca.w = csv.NewWriter(w)
 }
 
@@ -100,16 +104,14 @@ func (ca *CsvApi) SetRowDriverToRecord(rd RowDriver, r *Record) error {
 }
 
 func (ca *CsvApi) Encode(ctx context.Context, row RowDriver) (err error) {
-	csvRow, ok := row.(*RawRecordCsv)
-	if !ok {
-		return fmt.Errorf("expected RawRecordCsv but received another driver: %w", err)
-	}
-
-	err = ca.w.Write(csvRow.Data)
+	line, err := ca.EncodeRow(row)
 	if err != nil {
-		return fmt.Errorf("error ecnoding row: %w", err)
+		return err
 	}
-	ca.w.Flush()
+	line = append(line, '\n')
+	if _, err = ca.stream.Write(line); err != nil {
+		return fmt.Errorf("error encoding row: %w", err)
+	}
 	if ca.record != nil {
 		ca.record.Clean()
 	}
@@ -120,6 +122,47 @@ func (ca *CsvApi) Decode(ctx context.Context) (RowDriver, error) {
 	ca.record.Clean()
 	data, err := ca.r.Read()
 	if err != nil {
+		return nil, fmt.Errorf("error reading csv record: %w", err)
+	}
+	ca.record.Data = data
+
+	return ca.record, nil
+}
+
+func (ca *CsvApi) EncodeRow(row RowDriver) ([]byte, error) {
+	csvRow, ok := row.(*RawRecordCsv)
+	if !ok {
+		return nil, fmt.Errorf("expected RawRecordCsv but received another driver")
+	}
+
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	if err := w.Write(csvRow.Data); err != nil {
+		return nil, fmt.Errorf("error encoding row: %w", err)
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return nil, fmt.Errorf("error encoding row: %w", err)
+	}
+	if ca.record != nil {
+		ca.record.Clean()
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+func (ca *CsvApi) DecodeRow(line []byte) (RowDriver, error) {
+	ca.record.Clean()
+	r := csv.NewReader(bytes.NewReader(line))
+	data, err := r.Read()
+	if err != nil {
+		return nil, fmt.Errorf("error reading csv record: %w", err)
+	}
+	// Exactly one record per line: any trailing CSV record means the external command
+	// emitted more than one output for a single input.
+	if _, err = r.Read(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("error reading csv record: unexpected extra record on the same line")
+		}
 		return nil, fmt.Errorf("error reading csv record: %w", err)
 	}
 	ca.record.Data = data

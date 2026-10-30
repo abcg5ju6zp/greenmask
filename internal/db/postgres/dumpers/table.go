@@ -16,6 +16,7 @@ package dumpers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -89,7 +90,10 @@ func (td *TableDumper) dumper(ctx context.Context, eg *errgroup.Group, w io.Writ
 		if err := td.process(ctx, tx, w, pipeline); err != nil {
 			doneErr := pipeline.Done(ctx)
 			if doneErr != nil {
-				log.Warn().Err(err).Msg("error terminating transformation pipeline")
+				// Keep the original processing error as the primary cause; the termination
+				// error (e.g. unexpected transformer exit code) is appended, not substituted.
+				log.Warn().Err(doneErr).Msg("error terminating transformation pipeline")
+				err = errors.Join(err, fmt.Errorf("error terminating transformation pipeline: %w", doneErr))
 			}
 			return fmt.Errorf("error processing table dump %s.%s: %w", td.table.Schema, td.table.Name, err)
 		}
@@ -120,8 +124,21 @@ func (td *TableDumper) Execute(ctx context.Context, tx pgx.Tx, st storages.Stora
 
 func (td *TableDumper) process(ctx context.Context, tx pgx.Tx, w io.WriteCloser, pipeline Pipeliner) (err error) {
 	defer func() {
-		if err := w.Close(); err != nil {
-			log.Warn().Err(err).Msg("error closing TableDumper writer")
+		if err != nil {
+			// Abort the pipe with the failure: the storage writer receives this error
+			// instead of a successful gzip stream end, so the truncated table object
+			// cannot be published into the restorable data set.
+			if ec, ok := w.(ioutils.ErrorWriteCloser); ok {
+				if closeErr := ec.CloseWithError(err); closeErr != nil {
+					log.Debug().Err(closeErr).Msg("error aborting TableDumper writer with failure")
+				}
+			} else if closeErr := w.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("error closing TableDumper writer")
+			}
+			return
+		}
+		if closeErr := w.Close(); closeErr != nil {
+			log.Warn().Err(closeErr).Msg("error closing TableDumper writer")
 		}
 	}()
 

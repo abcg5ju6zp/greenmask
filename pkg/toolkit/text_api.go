@@ -80,9 +80,9 @@ func (ta *TextApi) SetRowDriverToRecord(rd RowDriver, r *Record) error {
 }
 
 func (ta *TextApi) Encode(ctx context.Context, row RowDriver) (err error) {
-	data, err := row.Encode()
+	data, err := ta.EncodeRow(row)
 	if err != nil {
-		return fmt.Errorf("error encodig row data via text interaction API: %w", err)
+		return err
 	}
 	data = append(data, '\n')
 	_, err = ta.w.Write(data)
@@ -100,7 +100,19 @@ func (ta *TextApi) Decode(ctx context.Context) (RowDriver, error) {
 		return nil, err
 	}
 
-	if err = ta.record.Decode(line); err != nil {
+	return ta.DecodeRow(line)
+}
+
+func (ta *TextApi) EncodeRow(row RowDriver) ([]byte, error) {
+	data, err := row.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("error encoding row data via text interaction API: %w", err)
+	}
+	return data, nil
+}
+
+func (ta *TextApi) DecodeRow(line []byte) (RowDriver, error) {
+	if err := ta.record.Decode(line); err != nil {
 		return nil, fmt.Errorf("error decoding via text interaction API: %w", err)
 	}
 

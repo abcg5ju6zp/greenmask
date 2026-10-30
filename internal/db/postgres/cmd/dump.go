@@ -252,9 +252,6 @@ func (d *Dump) schemaOnlyDump(ctx context.Context, tx pgx.Tx) error {
 // dumpWorkerPlanner - plans dump workers based on d.pgDumpOptions.Jobs
 func (d *Dump) dumpWorkerPlanner(ctx context.Context, tasks <-chan dumpers.DumpTask, done chan struct{}) func() error {
 	return func() error {
-		defer func() {
-			close(done)
-		}()
 		workerEg, gtx := errgroup.WithContext(ctx)
 		for j := 0; j < d.pgDumpOptions.Jobs; j++ {
 			workerEg.Go(
@@ -262,8 +259,13 @@ func (d *Dump) dumpWorkerPlanner(ctx context.Context, tasks <-chan dumpers.DumpT
 			)
 		}
 		if err := workerEg.Wait(); err != nil {
+			// Do not close done on failure: the heartbeat worker then exits via the
+			// cancelled context without publishing the "done" completion marker. TOC and
+			// metadata are gated by the dataDump error in Run.
 			return err
 		}
+		// Signal successful completion only - this triggers the "done" heartbeat write.
+		close(done)
 		return nil
 	}
 }

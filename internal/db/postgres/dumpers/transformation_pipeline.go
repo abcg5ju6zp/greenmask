@@ -16,6 +16,7 @@ package dumpers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -83,7 +84,7 @@ func NewTransformationPipeline(ctx context.Context, eg *errgroup.Group, table *e
 		w:                     w,
 		row:                   pgcopy.NewRow(len(table.Columns)),
 		transformationWindows: tws,
-		isAsync:               true,
+		isAsync:               isAsync,
 		record:                record,
 	}
 
@@ -97,27 +98,26 @@ func NewTransformationPipeline(ctx context.Context, eg *errgroup.Group, table *e
 }
 
 func (tp *TransformationPipeline) Init(ctx context.Context) error {
-	var lastInitErr error
-	var idx int
-	var t *utils.TransformerContext
-	for idx, t = range tp.table.TransformersContext {
+	// Stop initialising on the first failure: the table processing (including the async
+	// transformation windows) must never start with a partially initialised pipeline.
+	var initialized []*utils.TransformerContext
+	for _, t := range tp.table.TransformersContext {
 		if err := t.Transformer.Init(ctx); err != nil {
-			lastInitErr = err
 			log.Warn().Err(err).Msg("error initializing transformer")
+			var cleanupErrs []error
+			for _, prev := range initialized {
+				if doneErr := prev.Transformer.Done(ctx); doneErr != nil {
+					log.Warn().Err(doneErr).Msg("error terminating previously initialized transformer")
+					cleanupErrs = append(cleanupErrs, doneErr)
+				}
+			}
+			// Cleanup errors must accompany the initialisation error, never replace it.
+			return fmt.Errorf("unable to initialize transformer: %w", errors.Join(append(
+				[]error{err}, cleanupErrs...)...))
 		}
+		initialized = append(initialized, t)
 	}
 
-	if lastInitErr != nil {
-		lastInitialized := idx
-		for _, t = range tp.table.TransformersContext[:lastInitialized] {
-			if err := t.Transformer.Done(ctx); err != nil {
-				log.Warn().Err(err).Msg("error terminating previously initialized transformer")
-			}
-		}
-	}
-	if lastInitErr != nil {
-		return fmt.Errorf("unable to initialize transformer: %w", lastInitErr)
-	}
 	if tp.isAsync {
 		for _, w := range tp.transformationWindows {
 			w.init()
@@ -206,10 +206,10 @@ func (tp *TransformationPipeline) CompleteDump() (err error) {
 }
 
 func (tp *TransformationPipeline) Done(ctx context.Context) error {
-	var lastErr error
+	var errs []error
 	for _, t := range tp.table.TransformersContext {
 		if err := t.Transformer.Done(ctx); err != nil {
-			lastErr = err
+			errs = append(errs, err)
 			log.Warn().Err(err).Msg("error terminating initialized transformer")
 		}
 	}
@@ -219,8 +219,8 @@ func (tp *TransformationPipeline) Done(ctx context.Context) error {
 		}
 	}
 
-	if lastErr != nil {
-		return fmt.Errorf("error terminating initialized transformer: %w", lastErr)
+	if len(errs) > 0 {
+		return fmt.Errorf("error terminating initialized transformer: %w", errors.Join(errs...))
 	}
 	return nil
 }

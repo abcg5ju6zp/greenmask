@@ -21,11 +21,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/utils"
 	"github.com/greenmaskio/greenmask/pkg/toolkit"
@@ -39,6 +38,9 @@ const (
 	ValidateArgName        = "--validate"
 	PrintDefinitionArgName = "--print-definition"
 	TransformArgName       = "--transform"
+	// DefaultHandshakeTimeout - time to wait for the transformer ready acknowledgement
+	// after sending the table metadata.
+	DefaultHandshakeTimeout = 20 * time.Second
 )
 
 func ProduceNewCmdTransformerFunction(ctd *TransformerDefinition) utils.NewTransformerFunc {
@@ -55,7 +57,6 @@ type CmdTransformer struct {
 	name            string
 	executable      string
 	args            []string
-	eg              *errgroup.Group
 	driver          *toolkit.Driver
 	parameters      map[string]toolkit.Parameterizer
 	affectedColumns map[int]string
@@ -113,57 +114,67 @@ func (ct *CmdTransformer) Init(ctx context.Context) (err error) {
 	args := make([]string, len(ct.args))
 	copy(args, ct.args)
 	args = append(args, TransformArgName)
-	err = ct.BaseInit(ct.executable, args)
-	if err != nil {
+	if err = ct.BaseInit(ct.executable, args); err != nil {
 		return err
 	}
 
-	if err = ct.sendMetadata(); err != nil {
+	ct.initStderrHandler()
+	ct.StartSupervision(ctx)
+
+	// If the handshake or any initialisation step fails, the process must be reaped
+	// before the table pipeline is created: a dead transformer session must never be
+	// exposed to the table reading stage.
+	defer func() {
+		if err != nil {
+			if doneErr := ct.BaseDoneWithContext(ctx); doneErr != nil {
+				log.Debug().Err(doneErr).Msg("error cleaning up transformer after failed init")
+			}
+		}
+	}()
+
+	if err = ct.sendMetadata(ctx); err != nil {
 		return fmt.Errorf("error sending metadata: %w", err)
 	}
 
-	ct.eg = &errgroup.Group{}
-	ct.eg.Go(func() error {
-		return ct.stderrForwarder(ctx)
-	})
-
-	ct.eg.Go(func() error {
-		if err := ct.Cmd.Wait(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				if exitErr.ExitCode() != ct.ctd.ExpectedExitCode {
-					log.Warn().
-						Str("TableSchema", ct.driver.Table.Schema).
-						Str("TableName", ct.driver.Table.Name).
-						Str("TransformerName", ct.name).
-						Int("TransformerExitCode", ct.Cmd.ProcessState.ExitCode()).
-						Msg("unexpected exit code")
-					return fmt.Errorf("unexpeted transformer exit code: exepected %d received %d",
-						ct.ctd.ExpectedExitCode, ct.Cmd.ProcessState.ExitCode())
-				}
-				return err
-			} else {
-				log.Error().
-					Err(err).
-					Str("TableSchema", ct.driver.Table.Schema).
-					Str("TableName", ct.driver.Table.Name).
-					Str("TransformerName", ct.name).
-					Int("TransformerPid", ct.Cmd.Process.Pid).
-					Msg("custom transformer exited with error")
-				return fmt.Errorf("transformer exited with error: %w", err)
-			}
-		}
-
-		log.Debug().
-			Str("TableSchema", ct.driver.Table.Schema).
-			Str("TableName", ct.driver.Table.Name).
-			Str("TransformerName", ct.name).
-			Int("TransformerPid", ct.Cmd.Process.Pid).
-			Msg("transformer exited normally")
-		return nil
-	})
+	// The table processing starts only after the command has acknowledged its readiness,
+	// so the per-table process ownership and the record sequence are fixed upfront.
+	if err = ct.ReadHandshake(ctx, DefaultHandshakeTimeout); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+// Transform - performs one strict request/response roundtrip over the framed protocol.
+// The table-owned monotonic sequence is fixed by CmdTransformerBase.ExchangeEnvelope.
+func (ct *CmdTransformer) Transform(ctx context.Context, r *toolkit.Record) (*toolkit.Record, error) {
+	rd, err := ct.Api.GetRowDriverFromRecord(r)
+	if err != nil {
+		return nil, fmt.Errorf("dto api error: error getting dto: %w", err)
+	}
+
+	line, err := ct.Api.EncodeRow(rd)
+	if err != nil {
+		return nil, fmt.Errorf("interaction api error: cannot encode tuple for transformer: %w", err)
+	}
+
+	respLine, err := ct.ExchangeEnvelope(ctx, line)
+	if err != nil {
+		return nil, err
+	}
+
+	rd, err = ct.Api.DecodeRow(respLine)
+	if err != nil {
+		return nil, ct.Fail(fmt.Errorf("interaction api error: cannot parse transformed tuple: %w", err))
+	}
+
+	if err = ct.Api.SetRowDriverToRecord(rd, r); err != nil {
+		return nil, ct.Fail(fmt.Errorf("interaction api error: error setting transformed data to record: %w", err))
+	}
+
+	ct.Api.Clean()
+
+	return r, nil
 }
 
 func (ct *CmdTransformer) Validate(ctx context.Context) (toolkit.ValidationWarnings, error) {
@@ -172,7 +183,6 @@ func (ct *CmdTransformer) Validate(ctx context.Context) (toolkit.ValidationWarni
 	copy(args, ct.args)
 	args = append(args, ValidateArgName)
 
-	ct.eg = &errgroup.Group{}
 	ctx, cancel := context.WithTimeout(ctx, ct.ctd.ValidationTimeout)
 	defer cancel()
 	err := ct.BaseInitWithContext(ctx, ct.executable, args)
@@ -180,33 +190,15 @@ func (ct *CmdTransformer) Validate(ctx context.Context) (toolkit.ValidationWarni
 		return nil, fmt.Errorf("transformer initialisation error: %w", err)
 	}
 
-	if err = ct.sendMetadata(); err != nil {
+	ct.initStderrHandler()
+	ct.StartSupervision(ctx)
+
+	if err = ct.sendMetadata(ctx); err != nil {
+		if doneErr := ct.BaseDoneWithContext(ctx); doneErr != nil {
+			log.Debug().Err(doneErr).Msg("error cleaning up transformer after failed metadata send")
+		}
 		return nil, fmt.Errorf("error sending metadata: %w", err)
 	}
-
-	ct.eg.Go(func() error {
-		return ct.stderrForwarder(ctx)
-	})
-
-	ct.eg.Go(func() error {
-		if err := ct.Cmd.Wait(); err != nil {
-			log.Error().
-				Err(err).
-				Str("TableSchema", ct.driver.Table.Schema).
-				Str("TableName", ct.driver.Table.Name).
-				Str("TransformerName", ct.name).
-				Int("TransformerPid", ct.Cmd.Process.Pid).
-				Msg("custom transformer exited with error")
-			return fmt.Errorf("transformer exited with error: %w", err)
-		}
-		log.Debug().
-			Str("TableSchema", ct.driver.Table.Schema).
-			Str("TableName", ct.driver.Table.Name).
-			Str("TransformerName", ct.name).
-			Int("TransformerPid", ct.Cmd.Process.Pid).
-			Msg("transformer exited normally")
-		return nil
-	})
 
 	var warnings toolkit.ValidationWarnings
 
@@ -217,6 +209,12 @@ func (ct *CmdTransformer) Validate(ctx context.Context) (toolkit.ValidationWarni
 				break
 			}
 			log.Debug().Err(err).Msg("line reader error")
+			if doneErr := ct.BaseDoneWithContext(ctx); doneErr != nil {
+				log.Debug().Err(doneErr).Msg("error cleaning up transformer after validation failure")
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ErrValidationTimeout
+			}
 			return nil, err
 		}
 
@@ -238,38 +236,57 @@ func (ct *CmdTransformer) Validate(ctx context.Context) (toolkit.ValidationWarni
 		warnings = append(warnings, vw)
 	}
 
-	if err = ct.eg.Wait(); err != nil {
-		if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			log.Warn().
-				Err(err).
-				Str("TableSchema", ct.driver.Table.Schema).
-				Str("TableName", ct.driver.Table.Name).
-				Str("TransformerName", ct.name).
-				Int("TransformerPid", ct.Cmd.Process.Pid).
-				Dur("ValidationTimeout", ct.ctd.ValidationTimeout).
-				Msg("validation timeout")
-			return nil, ErrValidationTimeout
-		}
-		return nil, err
+	cleanupErr := ct.BaseDoneWithContext(ctx)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		log.Warn().
+			Dur("ValidationTimeout", ct.ctd.ValidationTimeout).
+			Str("TableSchema", ct.driver.Table.Schema).
+			Str("TableName", ct.driver.Table.Name).
+			Str("TransformerName", ct.name).
+			Msg("validation timeout")
+		return nil, ErrValidationTimeout
+	}
+
+	var cause error
+	if err := ct.ExitError(); err != nil {
+		cause = fmt.Errorf("transformer exited with error: %w", err)
+	}
+	if cause == nil && cleanupErr != nil {
+		cause = cleanupErr
+	}
+	if cause != nil {
+		return nil, ct.WithStderr(cause)
 	}
 
 	return warnings, nil
 }
 
+// Done - finishes the transformer session. Even when every record has been processed
+// successfully a non-zero unexpected exit status or extra unconsumed output still fails
+// the table and prevents TOC/metadata from being published. Cleanup errors never replace
+// the first recorded failure.
 func (ct *CmdTransformer) Done(ctx context.Context) error {
-	if err := ct.BaseDone(); err != nil {
-		return err
+	cleanupErr := ct.BaseDoneWithContext(ctx)
+
+	var cause error
+	if err := ct.FirstError(); err != nil {
+		cause = err
 	}
-	if err := ct.eg.Wait(); err != nil {
-		log.Warn().
-			Err(err).
-			Str("TableSchema", ct.driver.Table.Schema).
-			Str("TableName", ct.driver.Table.Name).
-			Str("TransformerName", ct.name).
-			Msg("one of custom transformer goroutine exited with error")
-		return fmt.Errorf("one of custom transformer goroutine exited with error: %w", err)
+	if err := ct.ExitError(); err != nil {
+		cause = errors.Join(cause, fmt.Errorf("transformer terminated with error: %w", err))
 	}
-	return nil
+	if tail := ct.TrailingOutput(); len(tail) > 0 {
+		cause = errors.Join(cause,
+			fmt.Errorf("transformer produced unexpected extra output after the last consumed record: %q",
+				string(tail)))
+	}
+	if cause == nil && cleanupErr != nil {
+		cause = fmt.Errorf("error terminating custom transformer: %w", cleanupErr)
+	} else if cleanupErr != nil {
+		cause = errors.Join(cause, fmt.Errorf("cleanup error: %w", cleanupErr))
+	}
+
+	return ct.WithStderr(cause)
 }
 
 func (ct *CmdTransformer) getMetadata() ([]byte, error) {
@@ -302,22 +319,18 @@ func (ct *CmdTransformer) getMetadata() ([]byte, error) {
 	return res, nil
 }
 
-func (ct *CmdTransformer) stderrForwarder(ctx context.Context) error {
+// initStderrHandler - forwards stderr lines to the log while the base supervision pump
+// retains them for the failure report. This is required for convenient verbosity of
+// output: print "stderr forwarding" message at most once per 500ms, otherwise each line
+// would be covered with the message and tracebacks or multiline messages would be hard
+// to recognize.
+func (ct *CmdTransformer) initStderrHandler() {
 	t := time.NewTicker(500 * time.Millisecond)
 	lineNum := 0
-	// This is required for convenient verbosity of output.
-	// Write "stderr forwarding" log message each 500ms otherwise just print received stderr data
-	// If it does not use this logic each line would be covered with "stderr forwarding" message,
-	// and it will be complicated to recognize the traceback or multiline message
-	for {
-		line, _, err := ct.StderrReader.ReadLine()
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-				return nil
-			}
-			log.Debug().Err(err).Msg("line reader error")
-			return err
-		}
+	var mx sync.Mutex
+	ct.StderrHandler = func(line []byte) {
+		mx.Lock()
+		defer mx.Unlock()
 
 		if lineNum == 0 {
 			log.Warn().
@@ -330,8 +343,6 @@ func (ct *CmdTransformer) stderrForwarder(ctx context.Context) error {
 		fmt.Printf("\tDATA: %s\n", string(line))
 
 		select {
-		case <-ctx.Done():
-			return nil
 		case <-t.C:
 			lineNum = 0
 		default:
@@ -340,7 +351,7 @@ func (ct *CmdTransformer) stderrForwarder(ctx context.Context) error {
 	}
 }
 
-func (ct *CmdTransformer) sendMetadata() error {
+func (ct *CmdTransformer) sendMetadata(ctx context.Context) error {
 	meta, err := ct.getMetadata()
 	if err != nil {
 		return err
@@ -353,9 +364,8 @@ func (ct *CmdTransformer) sendMetadata() error {
 		Msg("running transformer with metadata")
 
 	meta = append(meta, '\n')
-	_, err = ct.StdinWriter.Write(meta)
-	if err != nil {
-		return fmt.Errorf("error writing metatda to stdin: %w", err)
+	if err = ct.WriteLine(ctx, meta); err != nil {
+		return fmt.Errorf("error writing metadata to stdin: %w", err)
 	}
 	return nil
 }

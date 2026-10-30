@@ -122,13 +122,22 @@ func largeObjectWriter(ctx context.Context, st storages.Storager, lo *entries.La
 }
 
 func largeObjectDumper(ctx context.Context, lo *entries.LargeObject, w ioutils.CountWriteCloser, tx pgx.Tx) func() error {
-	return func() error {
+	return func() (err error) {
 		defer func() {
 			log.Debug().
 				Uint32("oid", uint32(lo.Oid)).
 				Msg("closing writer")
-			if err := w.Close(); err != nil {
-				log.Warn().Err(err).Msg("error closing blobs writer")
+			if err != nil {
+				// Abort the object on failure instead of publishing a truncated blob.
+				if ec, ok := w.(ioutils.ErrorWriteCloser); ok {
+					if closeErr := ec.CloseWithError(err); closeErr != nil {
+						log.Debug().Err(closeErr).Msg("error aborting blobs writer with failure")
+					}
+					return
+				}
+			}
+			if closeErr := w.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("error closing blobs writer")
 			}
 		}()
 		buf := make([]byte, loBufSize)

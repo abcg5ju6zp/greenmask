@@ -18,13 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/utils"
 	"github.com/greenmaskio/greenmask/pkg/toolkit"
@@ -138,7 +134,6 @@ type Cmd struct {
 	rowDriverParams        *toolkit.DriverParams
 
 	driver *toolkit.Driver
-	eg     *errgroup.Group
 }
 
 func NewCmd(
@@ -293,81 +288,36 @@ func (c *Cmd) GetAffectedColumns() map[int]string {
 	return c.affectedColumns
 }
 
-func (c *Cmd) Init(ctx context.Context) error {
-	if err := c.BaseInit(c.executable, c.args); err != nil {
+func (c *Cmd) Init(ctx context.Context) (err error) {
+	if err = c.BaseInit(c.executable, c.args); err != nil {
 		return err
 	}
-	c.eg = &errgroup.Group{}
-	c.eg.Go(func() error {
-		return c.stderrForwarder(ctx)
-	})
-
-	c.eg.Go(func() error {
-		if err := c.Cmd.Wait(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				if exitErr.ExitCode() != c.expectedExitCode {
-					log.Warn().
-						Str("TableSchema", c.driver.Table.Schema).
-						Str("TableName", c.driver.Table.Name).
-						Str("TransformerName", c.name).
-						Int("TransformerExitCode", c.Cmd.ProcessState.ExitCode()).
-						Msg("unexpected exit code")
-					return fmt.Errorf("unexpeted command exit code: exepected %d received %d",
-						c.expectedExitCode, c.Cmd.ProcessState.ExitCode())
-				}
-				return nil
-			} else {
-				log.Error().
-					Err(err).
-					Str("TableSchema", c.driver.Table.Schema).
-					Str("TableName", c.driver.Table.Name).
-					Str("TransformerName", c.name).
-					Int("TransformerPid", c.Cmd.Process.Pid).
-					Msg("cmd transformer exited with error")
-				return fmt.Errorf("transformer exited with error: %w", err)
-			}
-		}
-
-		log.Debug().
-			Str("TableSchema", c.driver.Table.Schema).
-			Str("TableName", c.driver.Table.Name).
-			Str("TransformerName", c.name).
-			Int("TransformerPid", c.Cmd.Process.Pid).
-			Msg("transformer exited normally")
-		return nil
-	})
-
+	c.initStderrHandler()
+	c.StartSupervision(ctx)
 	return nil
 }
 
 func (c *Cmd) Done(ctx context.Context) error {
-	if err := c.BaseDone(); err != nil {
-		return err
+	cleanupErr := c.BaseDoneWithContext(ctx)
+
+	var cause error
+	if err := c.FirstError(); err != nil {
+		cause = err
 	}
-	if err := c.eg.Wait(); err != nil {
-		log.Warn().
-			Err(err).
-			Str("TableSchema", c.driver.Table.Schema).
-			Str("TableName", c.driver.Table.Name).
-			Str("TransformerName", c.name).
-			Msg("cmd transformer goroutine exited with error")
-		return fmt.Errorf("cmd transformer goroutine exited with error: %w", err)
+	if err := c.ExitError(); err != nil {
+		cause = errors.Join(cause, fmt.Errorf("cmd transformer terminated with error: %w", err))
 	}
-	return nil
+	if cause == nil && cleanupErr != nil {
+		cause = fmt.Errorf("error terminating cmd transformer: %w", cleanupErr)
+	} else if cleanupErr != nil {
+		cause = errors.Join(cause, fmt.Errorf("cleanup error: %w", cleanupErr))
+	}
+
+	return c.WithStderr(cause)
 }
 
-func (c *Cmd) stderrForwarder(ctx context.Context) error {
-	for {
-		line, err := c.ReceiveStderrLine(ctx)
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-				return nil
-			}
-			log.Debug().Err(err).Msg("line reader error")
-			return err
-		}
-
+func (c *Cmd) initStderrHandler() {
+	c.StderrHandler = func(line []byte) {
 		log.Warn().
 			Str("TableSchema", c.driver.Table.Schema).
 			Str("TableName", c.driver.Table.Name).
@@ -375,12 +325,6 @@ func (c *Cmd) stderrForwarder(ctx context.Context) error {
 			Int("TransformerPid", c.Cmd.Process.Pid).
 			Msg("stderr forwarding")
 		fmt.Printf("\tDATA: %s\n", string(line))
-
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
 	}
 }
 

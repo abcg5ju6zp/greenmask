@@ -184,6 +184,7 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 		if cerr := file.Close(); cerr != nil {
 			log.Warn().Err(cerr).Str("path", absolutePath).Msg("error closing file after context cancellation")
 		}
+		s.removeIncompleteObject(ctx, client, absolutePath)
 		return ctx.Err()
 	case <-done:
 	}
@@ -192,6 +193,7 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 		if cerr := file.Close(); cerr != nil {
 			log.Warn().Err(cerr).Str("path", absolutePath).Msg("error closing file after failed write")
 		}
+		s.removeIncompleteObject(ctx, client, absolutePath)
 		return fmt.Errorf("write data to file %q via SFTP: %w", absolutePath, copyErr)
 	}
 
@@ -199,6 +201,15 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 		return fmt.Errorf("close file %q opened via SFTP: %w", absolutePath, err)
 	}
 	return nil
+}
+
+// removeIncompleteObject - deletes a partially uploaded object so that a truncated file
+// can never be treated as a part of a restorable backup. Removal failures are logged only
+// and must not mask the original uploading error.
+func (s *Storage) removeIncompleteObject(ctx context.Context, client SFTPClient, absolutePath string) {
+	if err := client.Remove(absolutePath); err != nil {
+		log.Warn().Err(err).Str("path", absolutePath).Msg("error removing incomplete SFTP object")
+	}
 }
 
 func (s *Storage) Delete(ctx context.Context, filePaths ...string) error {

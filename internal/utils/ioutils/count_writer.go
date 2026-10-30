@@ -16,6 +16,14 @@ package ioutils
 
 import "io"
 
+// ErrorWriteCloser - io.WriteCloser that can be closed with an error. Closing with an
+// error aborts the consuming side (e.g. io.PipeReader) instead of delivering a successful
+// EOF, which makes it impossible to publish truncated output as a completed object.
+type ErrorWriteCloser interface {
+	io.WriteCloser
+	CloseWithError(err error) error
+}
+
 type CountWriteCloser interface {
 	GetCount() int64
 	io.WriteCloser
@@ -39,6 +47,15 @@ func (cw *Writer) Write(p []byte) (int, error) {
 }
 
 func (cw *Writer) Close() error {
+	return cw.w.Close()
+}
+
+// CloseWithError - propagates the failure to the wrapped writer when it supports it,
+// so the consumer fails instead of receiving a successful end of stream.
+func (cw *Writer) CloseWithError(err error) error {
+	if pec, ok := cw.w.(ErrorWriteCloser); ok {
+		return pec.CloseWithError(err)
+	}
 	return cw.w.Close()
 }
 

@@ -16,6 +16,7 @@ package toolkit
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -136,15 +137,13 @@ func (j *JsonApi) SetRowDriverToRecord(rd RowDriver, r *Record) error {
 }
 
 func (j *JsonApi) Encode(ctx context.Context, row RowDriver) (err error) {
-	if row.Length() == 0 {
-		_, err = j.w.Write(emptyJson)
-		if err != nil {
-			return err
-		}
-	} else {
-		if err = j.encoder.Encode(row); err != nil {
-			return fmt.Errorf("error marshaling row driver: %w", err)
-		}
+	line, err := j.EncodeRow(row)
+	if err != nil {
+		return err
+	}
+	line = append(line, '\n')
+	if _, err = j.w.Write(line); err != nil {
+		return err
 	}
 
 	return nil
@@ -155,6 +154,32 @@ func (j *JsonApi) Decode(ctx context.Context) (RowDriver, error) {
 	j.record.Clean()
 	if err := j.decoder.Decode(j.record); err != nil {
 		return nil, fmt.Errorf("error unmarshalling json: %w", err)
+	}
+	return j.record, nil
+}
+
+func (j *JsonApi) EncodeRow(row RowDriver) ([]byte, error) {
+	if row.Length() == 0 {
+		return bytes.Clone(emptyJson[:len(emptyJson)-1]), nil
+	}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(row); err != nil {
+		return nil, fmt.Errorf("error marshaling row driver: %w", err)
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+func (j *JsonApi) DecodeRow(line []byte) (RowDriver, error) {
+
+	j.record.Clean()
+	dec := json.NewDecoder(bytes.NewReader(line))
+	if err := dec.Decode(j.record); err != nil {
+		return nil, fmt.Errorf("error unmarshalling json: %w", err)
+	}
+	// A line must carry exactly one JSON value. Any trailing data means the external
+	// command violated the one-line-one-record protocol (doubled or glued records).
+	if dec.More() {
+		return nil, fmt.Errorf("error unmarshalling json: unexpected data after the record")
 	}
 	return j.record, nil
 }

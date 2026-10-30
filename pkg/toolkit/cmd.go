@@ -15,6 +15,8 @@
 package toolkit
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -204,7 +206,6 @@ func (c *Cmd) performTransform(ctx context.Context) error {
 	if len(warnings) != 0 && warnings.IsFatal() {
 		return fmt.Errorf("fatal validation error")
 	}
-	rwChan := make(chan struct{}, 1)
 
 	affectedColumnsIdx, _, err := GetAffectedAndTransferringColumns(c.params, driver)
 	if err != nil {
@@ -217,51 +218,73 @@ func (c *Cmd) performTransform(ctx context.Context) error {
 		return fmt.Errorf("error inializing api: %w", err)
 	}
 
-	api.SetReader(os.Stdin)
-	api.SetWriter(os.Stdout)
+	stdinReader := bufio.NewReader(os.Stdin)
+	stdoutWriter := bufio.NewWriter(os.Stdout)
+
+	// Handshake: notify Greenmask that the metadata has been processed and the command
+	// is ready to receive records. Greenmask does not start reading the table before
+	// receiving this acknowledgement.
+	if _, err = stdoutWriter.Write(ReadyMessageLine()); err != nil {
+		return fmt.Errorf("error writing handshake message: %w", err)
+	}
+	if err = stdoutWriter.Flush(); err != nil {
+		return fmt.Errorf("error flushing handshake message: %w", err)
+	}
 
 	record := NewRecord(driver)
 	for {
-
-		var row RowDriver
-		go func() {
-			row, err = api.Decode(ctx)
-			rwChan <- struct{}{}
-		}()
-
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case <-rwChan:
 		}
 
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+		// One envelope per line. ReadBytes returns the trailing partial data together
+		// with io.EOF when the stream ends without a newline - that is a protocol error
+		// ("half record"), not a regular end of stream.
+		line, readErr := stdinReader.ReadBytes('\n')
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				if len(line) == 0 {
+					return nil
+				}
+				return fmt.Errorf("received truncated record envelope without newline: %w", io.ErrUnexpectedEOF)
 			}
+			return fmt.Errorf("error reading record envelope: %w", readErr)
+		}
+		line = bytes.TrimSuffix(line, []byte("\n"))
+
+		seq, payload, err := ParseRecordMessage(line)
+		if err != nil {
+			return fmt.Errorf("interaction protocol error: %w", err)
+		}
+
+		row, err := api.DecodeRow(payload)
+		if err != nil {
 			return fmt.Errorf("error decoding data via api: %w", err)
 		}
 
 		record.SetRow(row)
 
-		err = transformer.Transform(ctx, record)
-		if err != nil {
+		if err = transformer.Transform(ctx, record); err != nil {
 			return fmt.Errorf("transformation error: %w", err)
 		}
 		resultRow, err := record.Encode()
 		if err != nil {
 			return fmt.Errorf("error encoding record: %w", err)
 		}
+		resultLine, err := api.EncodeRow(resultRow)
+		if err != nil {
+			return fmt.Errorf("error encoding record: %w", err)
+		}
 
-		go func() {
-			err = api.Encode(ctx, resultRow)
-			rwChan <- struct{}{}
-		}()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-rwChan:
+		envelope, err := NewRecordMessageLine(seq, resultLine)
+		if err != nil {
+			return fmt.Errorf("interaction protocol error: %w", err)
+		}
+		if _, err = stdoutWriter.Write(envelope); err != nil {
+			return fmt.Errorf("error writing transformed record: %w", err)
+		}
+		if err = stdoutWriter.Flush(); err != nil {
+			return fmt.Errorf("error flushing transformed record: %w", err)
 		}
 	}
 }

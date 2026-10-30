@@ -54,8 +54,21 @@ if [ $print_config = "true" ]; then
   echo '{"name":"TwoDatesGen","description":"Generate diff between two dates","parameters":[{"name":"column_a","description":"test1","required":true,"is_column":true,"column_properties":{"affected":true,"allowed_types":["date","timestamp","timestamptz"]}},{"name":"column_b","description":"test2","required":true,"is_column":true,"column_properties":{"affected":true,"allowed_types":["date","timestamp","timestamptz"]}}]}'
   exit 0
 elif [ $transform = "true" ]; then
-    cat
+    # Framed protocol:
+    #   1. the first stdin line is the table metadata JSON - consume and ignore it
+    #   2. answer with the ready handshake acknowledgement
+    #   3. for every {"seq":N,"payload":"..."} envelope reply with the same seq and
+    #      pass the payload through unchanged
+    IFS= read -r _meta
+    printf '{"type":"ready"}\n'
+    while IFS= read -r line; do
+        seq=$(printf '%s' "$line" | sed 's/^{"seq":\(-\{0,1\}[0-9]*\),.*/\1/')
+        payload=$(printf '%s' "$line" | sed 's/^{"seq":[-0-9]*,"payload"://; s/}$//')
+        printf '{"seq":%s,"payload":%s}\n' "$seq" "$payload"
+    done
 elif [ $validate = "true" ]; then
+  # The first stdin line is the metadata - consume it before printing warnings
+  IFS= read -r _meta
   printf '{"msg": "test validation warning", "severity": "warning"}\n'
 else
   exit 1

@@ -37,6 +37,12 @@ type InteractionApi interface {
 	Encode(ctx context.Context, row RowDriver) error
 	// Decode - read data with new line from io.Reader and encode to toolkit.RowDriver
 	Decode(ctx context.Context) (RowDriver, error)
+	// EncodeRow - encode a single RowDriver into one raw line without the trailing newline symbol.
+	// Used by the framed interaction protocol, where each line is wrapped into an envelope.
+	EncodeRow(row RowDriver) ([]byte, error)
+	// DecodeRow - decode a single raw line (without the trailing newline symbol) into a RowDriver.
+	// The line must contain exactly one complete record: truncated or doubled data is an error.
+	DecodeRow(line []byte) (RowDriver, error)
 	// Clean - clean cached Record
 	Clean()
 }

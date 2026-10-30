@@ -67,3 +67,15 @@ func (gw *GzipWriter) Close() error {
 	}
 	return globalErr
 }
+
+// CloseWithError - aborts the underlying pipe with the provided failure without flushing
+// or writing the gzip completion trailer. Calling gzip Close here would block on writing
+// the trailer into the very pipe we are about to abort, so the compressor state is
+// discarded. The storage consumer receives the error and must treat the object as
+// failed/unpublished.
+func (gw *GzipWriter) CloseWithError(err error) error {
+	if pec, ok := gw.w.(ErrorWriteCloser); ok {
+		return pec.CloseWithError(err)
+	}
+	return gw.w.Close()
+}
